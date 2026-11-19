@@ -1,0 +1,3 @@
+numpy>=1.24
+# pandas only needed for degrade_imu.py local testing, not for main.py
+pandas>=2.0

@@ -1,0 +1,29 @@
+{
+  "n_samples": 8000,
+  "duration_s": 39.99500012397766,
+  "runtime_s": 0.3972432000009576,
+  "ms_per_imu_second": 9.932321509427968,
+  "peak_algorithm_bytes": 2504192,
+  "peak_algorithm_mb": 2.38818359375,
+  "column_order_detected": "gyro_accel",
+  "ts_unit": "ns",
+  "acc_unit": "m/s^2",
+  "fail_start_idx": 8000,
+  "n_failed": 0,
+  "n_spikes": 0,
+  "n_stuck": 398,
+  "n_gaps": 0,
+  "n_dups": 0,
+  "gravity_updates": 3637,
+  "coast_accel_world": [
+    0.0,
+    0.0,
+    0.0
+  ],
+  "coast_omega": [
+    5.304061745685601e-05,
+    -0.00646299456609654,
+    -0.019790314274607545
+  ],
+  "output": "outputs/synthetic/est_clean.txt"
+}
