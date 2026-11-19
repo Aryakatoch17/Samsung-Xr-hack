@@ -2,13 +2,18 @@
 machine_hall.zip
 _pptx.zip
 *.zip
-!submission/*.zip
+!submission/CollegeName_TeamName.zip
 data/euroc/**
 !data/euroc/.gitkeep
 data/synthetic/**
 !data/synthetic/.gitkeep
+data/euroc_replay/
+data/clean_*.csv
+data/degraded_imu.csv
+data/degrade_meta.json
 outputs/**
 !outputs/.gitkeep
+*.pptx
 
 # Python
 __pycache__/

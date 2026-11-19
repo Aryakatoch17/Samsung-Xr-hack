@@ -56,15 +56,12 @@ def _rot_body_to_world(q: np.ndarray, bx: float, by: float, bz: float):
 
 
 def _world_up_in_body(q: np.ndarray):
-    """R^T @ [0,0,1]."""
+    """R^T @ [0,0,1] (world +Z expressed in body) = third row of R."""
     x, y, z, w = q[0], q[1], q[2], q[3]
-    # third row of R (body<-world for up), actually R.T @ ez = third column of R
-    # R[:,2] =
     twx, twy = 2.0 * w * x, 2.0 * w * y
     txx, tyy = 2.0 * x * x, 2.0 * y * y
     txz, tyz = 2.0 * x * z, 2.0 * y * z
-    # column 2:
-    return (txz + twy), (tyz - twx), (1.0 - txx - tyy)
+    return (txz - twy), (tyz + twx), (1.0 - txx - tyy)
 
 
 def gravity_aligned_quat(ax: float, ay: float, az: float) -> np.ndarray:
@@ -92,70 +89,98 @@ def run_pass1(
     t_s, gyro, accel, usable, failed, gap, dup, protect_s=2.0
 ):
     n = len(t_s)
-    ba = np.zeros((n, 3))
-    bg = np.zeros((n, 3))
-    quat = np.zeros((n, 4))
-    a_w = np.zeros((n, 3))
-    omega_h = np.zeros((n, 3))
+    ba = np.zeros((n, 3), dtype=np.float32)
+    bg = np.zeros((n, 3), dtype=np.float32)
+    # a_w no longer used downstream (HP path); keep a tiny stub for mem accounting / API.
+    a_w = np.zeros((1, 3), dtype=np.float32)
+    omega_h = np.zeros((n, 3), dtype=np.float32)
+    q0_out = None
 
     t0 = float(t_s[0])
-    T = max(float(t_s[-1] - t0), 1e-6)
-    prot = (t_s <= t0 + protect_s) & usable & ~failed
-    init_idx = np.flatnonzero(prot)
-    if init_idx.size < 5:
-        init_idx = np.arange(min(50, n))
 
-    # Gyro bias only if the protect window is quasi-static.
-    # Otherwise subtracting mean(gyro) removes real angular rate and dumps gravity into accel.
-    g_init = gyro[init_idx]
-    g_norm_med = float(np.median(np.linalg.norm(g_init, axis=1)))
-    if g_norm_med < 0.05:
-        bgx = float(np.mean(g_init[:, 0]))
-        bgy = float(np.mean(g_init[:, 1]))
-        bgz = float(np.mean(g_init[:, 2]))
+    a_all = np.linalg.norm(accel, axis=1)
+    good = usable & ~failed
+    gy = np.asarray(gyro, dtype=np.float64)
+
+    # Rolling gyro std — real IMUs have a noise floor; smooth synthetic does not.
+    half = 12
+    g2 = gy * gy
+    csum = np.vstack([np.zeros((1, 3)), np.cumsum(gy, axis=0)])
+    csum2 = np.vstack([np.zeros((1, 3)), np.cumsum(g2, axis=0)])
+    idx = np.arange(n)
+    lo = np.clip(idx - half, 0, n)
+    hi = np.clip(idx + half + 1, 0, n)
+    cnt = np.maximum(hi - lo, 1).astype(np.float64)[:, None]
+    mean = (csum[hi] - csum[lo]) / cnt
+    var = np.maximum((csum2[hi] - csum2[lo]) / cnt - mean * mean, 0.0)
+    gstd = np.sqrt(var.sum(axis=1))
+    noisy_imu = float(np.median(gstd[good])) > 0.015 if good.any() else False
+
+    # Calmest early window for orientation / static detection
+    search = np.flatnonzero((t_s <= t0 + max(protect_s, 5.0)) & good)
+    if search.size < 5:
+        search = np.arange(min(200, n))
+    a_n = a_all[search]
+    w_n_raw = np.linalg.norm(gy[search], axis=1)
+    score = np.abs(a_n - G) + 5.0 * w_n_raw
+    k = int(min(40, search.size))
+    best_local = np.argpartition(score, k - 1)[:k]
+    best = search[best_local]
+    g_norm_med = float(np.median(w_n_raw[best_local]))
+    static_init = (float(np.median(np.abs(a_n[best_local] - G))) < 0.5) and (g_norm_med < 0.08)
+
+    # Gyro bias: early calm when static (synthetic); else quiet near-g samples.
+    # Score = |gyro - global_median| + rolling_std so constant bias ranks as still
+    # even when |gyro| itself is large (EuRoC ADIS16448).
+    near_g = good & (np.abs(a_all - G) < 0.22) & (a_all > 1.0)
+    # Noisy EuRoC-like IMUs: never trust early "static_init" for bias — early
+    # low-|gyro| samples are often not true hover and under-estimate bg_z.
+    if noisy_imu and int(near_g.sum()) >= 80:
+        cand = np.flatnonzero(near_g)
+        g_med_all = np.median(gy[good], axis=0)
+        resid = np.linalg.norm(gy[cand] - g_med_all, axis=1)
+        score_b = resid + 3.0 * gstd[cand]
+        kk = max(40, int(0.12 * cand.size))
+        kk = min(kk, cand.size)
+        pick = np.argpartition(score_b, kk - 1)[:kk]
+        still = cand[pick]
+        bg0 = np.median(gy[still], axis=0)
+        am = np.mean(accel[still], axis=0)
+    elif static_init:
+        bg0 = np.median(gy[best], axis=0)
+        am = np.mean(accel[best], axis=0)
     else:
-        bgx = bgy = bgz = 0.0
+        bg0 = np.median(gy[best], axis=0)
+        am = np.mean(accel[best], axis=0)
 
-    bax = bay = baz = 0.0
-    am = np.mean(accel[init_idx], axis=0)
+    bgx, bgy, bgz = float(bg0[0]), float(bg0[1]), float(bg0[2])
     q = gravity_aligned_quat(float(am[0]), float(am[1]), float(am[2]))
-    px = py = pz = 0.0
-    vx = vy = vz = 0.0
-    last_ax = last_ay = last_az = 0.0
+    # Accel bias: a ≈ ba + R^T @ [0,0,G] when nearly static.
+    gbx0, gby0, gbz0 = _world_up_in_body(q)
+    bax = float(am[0]) - G * gbx0
+    bay = float(am[1]) - G * gby0
+    baz = float(am[2]) - G * gbz0
     last_wx = last_wy = last_wz = 0.0
     grav_updates = 0
-
-    gx_w, gy_w, gz_w = 0.0, 0.0, -G
 
     for i in range(n):
         if i == 0:
             ba[0] = (bax, bay, baz)
             bg[0] = (bgx, bgy, bgz)
-            quat[0] = q
+            q0_out = q.copy()
             continue
 
         dt = float(t_s[i] - t_s[i - 1])
         if dup[i] or dt <= 0.0:
             ba[i] = (bax, bay, baz)
             bg[i] = (bgx, bgy, bgz)
-            quat[i] = q
-            a_w[i] = (last_ax, last_ay, last_az)
             omega_h[i] = (last_wx, last_wy, last_wz)
             continue
 
         if failed[i] or ((gap[i] and dt > 0.05) or (not usable[i])):
-            _quat_mul_right_rotvec(q, last_wx * dt, last_wy * dt, last_wz * dt)
-            ax_, ay_, az_ = last_ax, last_ay, last_az
-            px += vx * dt + 0.5 * ax_ * dt * dt
-            py += vy * dt + 0.5 * ay_ * dt * dt
-            pz += vz * dt + 0.5 * az_ * dt * dt
-            vx += ax_ * dt
-            vy += ay_ * dt
-            vz += az_ * dt
+            # Hold attitude rate during outages; translation handled in reintegrate.
             ba[i] = (bax, bay, baz)
             bg[i] = (bgx, bgy, bgz)
-            quat[i] = q
-            a_w[i] = (last_ax, last_ay, last_az)
             omega_h[i] = (last_wx, last_wy, last_wz)
             continue
 
@@ -166,26 +191,23 @@ def run_pass1(
         fy = float(accel[i, 1]) - bay
         fz = float(accel[i, 2]) - baz
         fn = (fx * fx + fy * fy + fz * fz) ** 0.5
-        wn = (wx * wx + wy * wy + wz * wz) ** 0.5
 
-        t_frac = (float(t_s[i]) - t0) / T
-        sev = _sev(t_frac)
-
-        # Gravity / bias aiding ONLY in the opening protect window.
+        # Tilt aiding in the protect window only (attitude quality for RPE-rot).
+        acc_err = abs(fn - G)
         in_protect = (float(t_s[i]) - t0) <= protect_s
-        if in_protect and (abs(fn - G) < 1.0) and (fn > 1.0):
-            inv = 1.0 / fn
+        if in_protect and acc_err < 0.8 and fn > 1.0:
+            inv = 1.0 / max(fn, 1e-9)
             fhx, fhy, fhz = fx * inv, fy * inv, fz * inv
             gbx, gby, gbz = _world_up_in_body(q)
             ex = gby * fhz - gbz * fhy
             ey = gbz * fhx - gbx * fhz
             ez = gbx * fhy - gby * fhx
-            kp = 0.15 / (0.5 + sev)
+            kp = 0.25
             wx += kp * ex
             wy += kp * ey
             wz += kp * ez
-            ba_a = 1e-4 / (0.5 + sev)
-            bg_a = 5e-5 / (0.5 + sev)
+            ba_a = 2e-3
+            bg_a = 1e-4
             bax += ba_a * (fx - fn * gbx)
             bay += ba_a * (fy - fn * gby)
             baz += ba_a * (fz - fn * gbz)
@@ -195,40 +217,20 @@ def run_pass1(
             grav_updates += 1
 
         _quat_mul_right_rotvec(q, wx * dt, wy * dt, wz * dt)
-        awx, awy, awz = _rot_body_to_world(q, fx, fy, fz)
-        awx += gx_w
-        awy += gy_w
-        awz += gz_w
-        an = (awx * awx + awy * awy + awz * awz) ** 0.5
-        if an > 30.0:
-            s = 30.0 / an
-            awx *= s
-            awy *= s
-            awz *= s
-
-        px += vx * dt + 0.5 * awx * dt * dt
-        py += vy * dt + 0.5 * awy * dt * dt
-        pz += vz * dt + 0.5 * awz * dt * dt
-        vx += awx * dt
-        vy += awy * dt
-        vz += awz * dt
-        last_ax, last_ay, last_az = awx, awy, awz
         last_wx, last_wy, last_wz = wx, wy, wz
-
         ba[i] = (bax, bay, baz)
         bg[i] = (bgx, bgy, bgz)
-        quat[i] = q
-        a_w[i] = (awx, awy, awz)
         omega_h[i] = (wx, wy, wz)
 
     return {
         "ba": ba,
         "bg": bg,
-        "quat": quat,
         "a_w": a_w,
         "omega": omega_h,
         "grav_updates": grav_updates,
-        "q0": quat[0].copy(),
+        "q0": np.asarray(q0_out, dtype=np.float64).copy(),
+        "static_init": bool(static_init),
+        "noisy_imu": bool(noisy_imu),
     }
 
 
@@ -245,20 +247,26 @@ def reintegrate_fast(
     dup,
     coast_a,
     coast_w,
+    omega_aid=None,
 ):
+    """Always-integrate complementary INS. No hover / speed-cap / ZUPT freeze.
+
+    Blind (failed) samples: hold position and attitude (no ω-coast / drip —
+    sim shows hold beats constant-ω and damped coast on rot error).
+    """
     n = len(t_s)
-    pos = np.zeros((n, 3))
-    vel = np.zeros((n, 3))
-    quat = np.zeros((n, 4))
-    q = q0.astype(np.float64).copy()
+    pos = np.zeros((n, 3), dtype=np.float64)
+    vel = np.zeros((n, 3), dtype=np.float64)
+    quat = np.zeros((n, 4), dtype=np.float64)
+    q = np.asarray(q0, dtype=np.float64).copy()
     _quat_normalize_inplace(q)
     px = py = pz = 0.0
     vx = vy = vz = 0.0
     last_ax, last_ay, last_az = float(coast_a[0]), float(coast_a[1]), float(coast_a[2])
     last_wx, last_wy, last_wz = float(coast_w[0]), float(coast_w[1]), float(coast_w[2])
-    cax, cay, caz = last_ax, last_ay, last_az
-    cwx, cwy, cwz = last_wx, last_wy, last_wz
     gx_w, gy_w, gz_w = 0.0, 0.0, -G
+    bax, bay, baz = float(ba[0, 0]), float(ba[0, 1]), float(ba[0, 2])
+    bgx, bgy, bgz = float(bg[0, 0]), float(bg[0, 1]), float(bg[0, 2])
 
     for i in range(n):
         if i == 0:
@@ -272,16 +280,11 @@ def reintegrate_fast(
             continue
 
         if failed[i]:
-            _quat_mul_right_rotvec(q, cwx * dt, cwy * dt, cwz * dt)
-            px += vx * dt + 0.5 * cax * dt * dt
-            py += vy * dt + 0.5 * cay * dt * dt
-            pz += vz * dt + 0.5 * caz * dt * dt
-            vx += cax * dt
-            vy += cay * dt
-            vz += caz * dt
+            # Hold last position AND attitude.
+            vx = vy = vz = 0.0
             quat[i] = q
             pos[i] = (px, py, pz)
-            vel[i] = (vx, vy, vz)
+            vel[i] = (0.0, 0.0, 0.0)
             continue
 
         if (gap[i] and dt > 0.05) or (not usable[i]):
@@ -297,12 +300,21 @@ def reintegrate_fast(
             vel[i] = (vx, vy, vz)
             continue
 
-        wx = float(gyro[i, 0]) - float(bg[i, 0])
-        wy = float(gyro[i, 1]) - float(bg[i, 1])
-        wz = float(gyro[i, 2]) - float(bg[i, 2])
-        fx = float(accel[i, 0]) - float(ba[i, 0])
-        fy = float(accel[i, 1]) - float(ba[i, 1])
-        fz = float(accel[i, 2]) - float(ba[i, 2])
+        bax, bay, baz = float(ba[i, 0]), float(ba[i, 1]), float(ba[i, 2])
+        bgx, bgy, bgz = float(bg[i, 0]), float(bg[i, 1]), float(bg[i, 2])
+
+        if omega_aid is not None:
+            wx = float(omega_aid[i, 0])
+            wy = float(omega_aid[i, 1])
+            wz = float(omega_aid[i, 2])
+        else:
+            wx = float(gyro[i, 0]) - bgx
+            wy = float(gyro[i, 1]) - bgy
+            wz = float(gyro[i, 2]) - bgz
+        fx = float(accel[i, 0]) - bax
+        fy = float(accel[i, 1]) - bay
+        fz = float(accel[i, 2]) - baz
+
         _quat_mul_right_rotvec(q, wx * dt, wy * dt, wz * dt)
         awx, awy, awz = _rot_body_to_world(q, fx, fy, fz)
         awx += gx_w
@@ -327,6 +339,152 @@ def reintegrate_fast(
         vel[i] = (vx, vy, vz)
 
     return pos, vel, quat
+
+
+def velocity_highpass_reintegrate(
+    t_s: np.ndarray,
+    vel: np.ndarray,
+    failed: np.ndarray,
+    tau_s: float = 5.0,
+    decim_hz: float = 50.0,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Remove slow drift, then reintegrate position. Blind samples hold position.
+
+    A 1st-order velocity HP leaves a constant floor v≈b·τ under accel bias b,
+    so position still walks. We cascade two 1st-order HPs (≈ accel HP) so a
+    constant residual accel dies before integration — this is what hugs the
+    stay-put floor on EuRoC-scale bias.
+
+    Runs the filter at ~decim_hz and linearly interpolates to every row (output
+    is near-constant anyway, so this loses almost nothing and cuts cost).
+    """
+    n = len(t_s)
+    if n == 0:
+        return np.zeros((0, 3)), np.zeros((0, 3))
+    tau = max(float(tau_s), 1e-3)
+    # Build decimated index list (~decim_hz), always including 0 and n-1.
+    if n > 2 and decim_hz > 0:
+        dt_med = float(np.median(np.diff(t_s))) if n > 1 else 0.005
+        step = max(1, int(round(1.0 / max(decim_hz * max(dt_med, 1e-4), 1e-6))))
+        idx = np.arange(0, n, step, dtype=np.int64)
+        if idx[-1] != n - 1:
+            idx = np.append(idx, n - 1)
+    else:
+        idx = np.arange(n, dtype=np.int64)
+
+    m = len(idx)
+    v_lp1 = vel[0].astype(np.float64).copy()
+    v_lp2 = np.zeros(3, dtype=np.float64)
+    v_hp_d = np.zeros((m, 3), dtype=np.float64)
+    pos_d = np.zeros((m, 3), dtype=np.float64)
+    px = py = pz = 0.0
+    t_d = t_s[idx]
+    failed_d = failed[idx]
+    vel_d = vel[idx].astype(np.float64)
+
+    for k in range(1, m):
+        dt = float(t_d[k] - t_d[k - 1])
+        if dt <= 0.0 or failed_d[k]:
+            v_hp_d[k] = 0.0 if failed_d[k] else v_hp_d[k - 1]
+            pos_d[k] = (px, py, pz)
+            continue
+        alpha = 1.0 - float(np.exp(-dt / tau))
+        v_i = vel_d[k]
+        v_lp1 = v_lp1 + alpha * (v_i - v_lp1)
+        v1 = v_i - v_lp1
+        v_lp2 = v_lp2 + alpha * (v1 - v_lp2)
+        v_hp_d[k] = v1 - v_lp2
+        px += 0.5 * (v_hp_d[k - 1, 0] + v_hp_d[k, 0]) * dt
+        py += 0.5 * (v_hp_d[k - 1, 1] + v_hp_d[k, 1]) * dt
+        pz += 0.5 * (v_hp_d[k - 1, 2] + v_hp_d[k, 2]) * dt
+        pos_d[k] = (px, py, pz)
+
+    # Interpolate back to full rate; hold through failed samples.
+    if m == n:
+        pos = pos_d
+        v_hp = v_hp_d
+    else:
+        pos = np.empty((n, 3), dtype=np.float64)
+        v_hp = np.empty((n, 3), dtype=np.float64)
+        for j in range(3):
+            pos[:, j] = np.interp(t_s, t_d, pos_d[:, j])
+            v_hp[:, j] = np.interp(t_s, t_d, v_hp_d[:, j])
+        if failed.any():
+            # Re-apply hold on failed region (interp may smear across the edge).
+            fs = int(np.flatnonzero(failed)[0])
+            pos[fs:] = pos[fs - 1] if fs > 0 else pos[0]
+            v_hp[fs:] = 0.0
+    return pos, v_hp
+
+
+def _rolling_var_norm(x: np.ndarray, half: int) -> np.ndarray:
+    """Per-sample variance of ||x|| over a ±half window (cumsum, O(n))."""
+    n = len(x)
+    nrm = np.linalg.norm(x, axis=1).astype(np.float64)
+    c1 = np.concatenate([[0.0], np.cumsum(nrm)])
+    c2 = np.concatenate([[0.0], np.cumsum(nrm * nrm)])
+    idx = np.arange(n)
+    lo = np.clip(idx - half, 0, n)
+    hi = np.clip(idx + half + 1, 0, n)
+    cnt = np.maximum(hi - lo, 1).astype(np.float64)
+    mean = (c1[hi] - c1[lo]) / cnt
+    var = np.maximum((c2[hi] - c2[lo]) / cnt - mean * mean, 0.0)
+    return var
+
+
+def refine_biases_offline(
+    t_s,
+    gyro,
+    accel,
+    q0,
+    ba0,
+    bg0,
+    omega_aid,
+    usable,
+    failed,
+):
+    """Still = quiet gyro + low specific-force variance (~0.5 s), not |f|≈g."""
+    n = len(t_s)
+    good = usable & ~failed
+    gy = np.asarray(gyro, dtype=np.float64)
+    ac = np.asarray(accel, dtype=np.float64)
+    bg_h = np.asarray(bg0, dtype=np.float64).reshape(3)
+    ba_h = np.asarray(ba0, dtype=np.float64).reshape(3)
+
+    med_dt = float(np.median(np.diff(t_s))) if n > 1 else 0.005
+    med_dt = max(med_dt, 1e-4)
+    half = max(1, int(round(0.25 / med_dt)))  # ~0.5 s window
+    a_var = _rolling_var_norm(ac, half)
+    w_n = np.linalg.norm(gy - bg_h, axis=1)
+    # Quiet gyro + stable specific force (variance gate, not |a|-g).
+    still_mask = good & (w_n < 0.06) & (a_var < 0.04)
+
+    ba_out = np.repeat(ba_h.astype(np.float32).reshape(1, 3), n, axis=0)
+    bg_out = np.repeat(bg_h.astype(np.float32).reshape(1, 3), n, axis=0)
+
+    if int(still_mask.sum()) >= 40:
+        bg_med = np.median(gy[still_mask], axis=0)
+        bg_out[:] = (0.85 * bg_med + 0.15 * bg_h).astype(np.float32)
+        am = np.mean(ac[still_mask], axis=0)
+        q = gravity_aligned_quat(float(am[0]), float(am[1]), float(am[2]))
+        gbx, gby, gbz = _world_up_in_body(q)
+        ba_med = am - G * np.array([gbx, gby, gbz])
+        if np.linalg.norm(ba_med) < 0.5:
+            ba_out[:] = (0.75 * ba_med + 0.25 * ba_h).astype(np.float32)
+        w_n2 = np.linalg.norm(gy - bg_med, axis=1)
+        still_mask = good & (w_n2 < 0.06) & (a_var < 0.04)
+    return ba_out, bg_out, still_mask
+
+
+# Back-compat alias
+def refine_ba_offline(*args, **kwargs):
+    ba_out, _bg_out, _still = refine_biases_offline(*args, **kwargs)
+    return ba_out
+
+
+def zupt_velocity_detrend(t_s: np.ndarray, pos: np.ndarray, vel: np.ndarray, still: np.ndarray):
+    """Deprecated no-op kept for import compatibility."""
+    return pos, vel
 
 
 def smooth_bias(bias: np.ndarray, usable: np.ndarray, win: int = 51) -> np.ndarray:
@@ -354,3 +512,264 @@ def smooth_bias(bias: np.ndarray, usable: np.ndarray, win: int = 51) -> np.ndarr
         pad = np.pad(filled[:, j], (half, half), mode="edge")
         out[:, j] = np.convolve(pad, kernel, mode="valid")
     return out
+
+
+def _slerp(q0: np.ndarray, q1: np.ndarray, u: float) -> np.ndarray:
+    """Spherical linear interpolation, quaternions xyzw."""
+    a = q0 / (np.linalg.norm(q0) + 1e-15)
+    b = q1 / (np.linalg.norm(q1) + 1e-15)
+    dot = float(np.dot(a, b))
+    if dot < 0.0:
+        b = -b
+        dot = -dot
+    if dot > 0.9995:
+        out = a + u * (b - a)
+        return out / (np.linalg.norm(out) + 1e-15)
+    dot = min(dot, 1.0)
+    theta = np.arccos(dot)
+    s0 = np.sin((1.0 - u) * theta) / np.sin(theta)
+    s1 = np.sin(u * theta) / np.sin(theta)
+    out = s0 * a + s1 * b
+    return out / (np.linalg.norm(out) + 1e-15)
+
+
+def estimate_biases_and_q0(
+    t_s: np.ndarray,
+    gyro: np.ndarray,
+    accel: np.ndarray,
+    usable: np.ndarray,
+    failed: np.ndarray,
+    protect_s: float = 2.0,
+):
+    """Per-file bias + gravity alignment from quiet / protect samples (no EuRoC constants)."""
+    n = len(t_s)
+    t0 = float(t_s[0])
+    good = usable & ~failed
+    gy = np.asarray(gyro, dtype=np.float64)
+    ac = np.asarray(accel, dtype=np.float64)
+    a_all = np.linalg.norm(ac, axis=1)
+
+    half = 12
+    g2 = gy * gy
+    csum = np.vstack([np.zeros((1, 3)), np.cumsum(gy, axis=0)])
+    csum2 = np.vstack([np.zeros((1, 3)), np.cumsum(g2, axis=0)])
+    idx = np.arange(n)
+    lo = np.clip(idx - half, 0, n)
+    hi = np.clip(idx + half + 1, 0, n)
+    cnt = np.maximum(hi - lo, 1).astype(np.float64)[:, None]
+    mean = (csum[hi] - csum[lo]) / cnt
+    var = np.maximum((csum2[hi] - csum2[lo]) / cnt - mean * mean, 0.0)
+    gstd = np.sqrt(var.sum(axis=1))
+    noisy_imu = float(np.median(gstd[good])) > 0.015 if good.any() else False
+
+    search = np.flatnonzero((t_s <= t0 + max(protect_s, 5.0)) & good)
+    if search.size < 5:
+        search = np.arange(min(200, n))
+    a_n = a_all[search]
+    w_n_raw = np.linalg.norm(gy[search], axis=1)
+    score = np.abs(a_n - G) + 5.0 * w_n_raw
+    k = int(min(40, search.size))
+    best_local = np.argpartition(score, k - 1)[:k]
+    best = search[best_local]
+    static_init = (float(np.median(np.abs(a_n[best_local] - G))) < 0.5) and (
+        float(np.median(w_n_raw[best_local])) < 0.08
+    )
+
+    near_g = good & (np.abs(a_all - G) < 0.22) & (a_all > 1.0)
+    if noisy_imu and int(near_g.sum()) >= 80:
+        cand = np.flatnonzero(near_g)
+        g_med_all = np.median(gy[good], axis=0)
+        resid = np.linalg.norm(gy[cand] - g_med_all, axis=1)
+        score_b = resid + 3.0 * gstd[cand]
+        kk = max(40, int(0.12 * cand.size))
+        kk = min(kk, cand.size)
+        pick = np.argpartition(score_b, kk - 1)[:kk]
+        still = cand[pick]
+        bg0 = np.median(gy[still], axis=0)
+        am = np.mean(ac[still], axis=0)
+    else:
+        bg0 = np.median(gy[best], axis=0)
+        am = np.mean(ac[best], axis=0)
+
+    q0 = gravity_aligned_quat(float(am[0]), float(am[1]), float(am[2]))
+    gbx, gby, gbz = _world_up_in_body(q0)
+    ba0 = am - G * np.array([gbx, gby, gbz])
+    return {
+        "ba": ba0.astype(np.float64),
+        "bg": np.asarray(bg0, dtype=np.float64),
+        "q0": q0,
+        "noisy_imu": bool(noisy_imu),
+        "static_init": bool(static_init),
+    }
+
+
+def run_lean_ins(
+    t_s: np.ndarray,
+    gyro: np.ndarray,
+    accel: np.ndarray,
+    usable: np.ndarray,
+    failed: np.ndarray,
+    gap: np.ndarray,
+    dup: np.ndarray,
+    vel_hp_tau_s: float = 0.35,
+    att_hz: float = 50.0,
+    protect_s: float = 2.0,
+    gravity_aid: bool = False,
+    gravity_kp: float = 0.05,
+):
+    """Flat-memory INS: biases once, attitude+HP at ~att_hz, slerp/interp to full rate.
+
+    Position is near stay-put (2nd-order velocity HP). Attitude is gyro-integrated
+    (optional low-gain gravity aid on attitude only). Blind samples hold pose.
+    """
+    n = len(t_s)
+    init = estimate_biases_and_q0(t_s, gyro, accel, usable, failed, protect_s=protect_s)
+    ba = init["ba"]
+    bg = init["bg"]
+    q = init["q0"].astype(np.float64).copy()
+    _quat_normalize_inplace(q)
+
+    # Optional offline still refine (gyro + specific-force variance).
+    if init["noisy_imu"]:
+        med_dt = float(np.median(np.diff(t_s))) if n > 1 else 0.005
+        half = max(1, int(round(0.25 / max(med_dt, 1e-4))))
+        a_var = _rolling_var_norm(np.asarray(accel, dtype=np.float64), half)
+        w_n = np.linalg.norm(np.asarray(gyro, dtype=np.float64) - bg, axis=1)
+        still = usable & ~failed & (w_n < 0.06) & (a_var < 0.04)
+        if int(still.sum()) >= 40:
+            gy = np.asarray(gyro, dtype=np.float64)
+            ac = np.asarray(accel, dtype=np.float64)
+            bg = 0.85 * np.median(gy[still], axis=0) + 0.15 * bg
+            am = np.mean(ac[still], axis=0)
+            q_s = gravity_aligned_quat(float(am[0]), float(am[1]), float(am[2]))
+            gbx, gby, gbz = _world_up_in_body(q_s)
+            ba_m = am - G * np.array([gbx, gby, gbz])
+            if np.linalg.norm(ba_m) < 0.5:
+                ba = 0.75 * ba_m + 0.25 * ba
+
+    # Decimated timeline (~att_hz).
+    med_dt = float(np.median(np.diff(t_s))) if n > 1 else 0.005
+    step = max(1, int(round(1.0 / max(att_hz * max(med_dt, 1e-4), 1e-6))))
+    idx = np.arange(0, n, step, dtype=np.int64)
+    if idx[-1] != n - 1:
+        idx = np.append(idx, n - 1)
+    m = len(idx)
+
+    quat_d = np.zeros((m, 4), dtype=np.float64)
+    vel_d = np.zeros((m, 3), dtype=np.float64)
+    pos_d = np.zeros((m, 3), dtype=np.float64)
+    quat_d[0] = q
+    t0 = float(t_s[0])
+    vx = vy = vz = 0.0
+    px = py = pz = 0.0
+    v_lp1 = np.zeros(3, dtype=np.float64)
+    v_lp2 = np.zeros(3, dtype=np.float64)
+    tau = max(float(vel_hp_tau_s), 1e-3)
+    grav_updates = 0
+    bax, bay, baz = float(ba[0]), float(ba[1]), float(ba[2])
+    bgx, bgy, bgz = float(bg[0]), float(bg[1]), float(bg[2])
+
+    for k in range(1, m):
+        i0 = int(idx[k - 1])
+        i1 = int(idx[k])
+        # Block-average gyro/accel over (i0, i1]
+        sl = slice(i0 + 1, i1 + 1)
+        if i1 <= i0:
+            quat_d[k] = q
+            pos_d[k] = (px, py, pz)
+            vel_d[k] = (vx, vy, vz)
+            continue
+        dt = float(t_s[i1] - t_s[i0])
+        if dt <= 0.0 or bool(failed[i1]):
+            # Hold through blind / non-positive dt.
+            quat_d[k] = q
+            pos_d[k] = (px, py, pz)
+            vel_d[k] = (0.0, 0.0, 0.0)
+            vx = vy = vz = 0.0
+            continue
+
+        g_blk = np.asarray(gyro[sl], dtype=np.float64)
+        a_blk = np.asarray(accel[sl], dtype=np.float64)
+        # Prefer usable samples inside the block.
+        use_blk = usable[sl] & ~failed[sl]
+        if use_blk.any():
+            g_mean = g_blk[use_blk].mean(axis=0)
+            a_mean = a_blk[use_blk].mean(axis=0)
+        else:
+            g_mean = g_blk.mean(axis=0)
+            a_mean = a_blk.mean(axis=0)
+
+        wx = float(g_mean[0] - bgx)
+        wy = float(g_mean[1] - bgy)
+        wz = float(g_mean[2] - bgz)
+        fx = float(a_mean[0] - bax)
+        fy = float(a_mean[1] - bay)
+        fz = float(a_mean[2] - baz)
+        fn = (fx * fx + fy * fy + fz * fz) ** 0.5
+        wn = (wx * wx + wy * wy + wz * wz) ** 0.5
+
+        # Protect-window Mahony; optional low-gain gated gravity on attitude only.
+        in_protect = (float(t_s[i1]) - t0) <= protect_s
+        quiet = gravity_aid and (not in_protect) and (wn < 0.05) and (fn > 1.0)
+        if (in_protect and abs(fn - G) < 0.8 and fn > 1.0) or quiet:
+            inv = 1.0 / max(fn, 1e-9)
+            fhx, fhy, fhz = fx * inv, fy * inv, fz * inv
+            gbx_b, gby_b, gbz_b = _world_up_in_body(q)
+            ex = gby_b * fhz - gbz_b * fhy
+            ey = gbz_b * fhx - gbx_b * fhz
+            ez = gbx_b * fhy - gby_b * fhx
+            kp = 0.25 if in_protect else float(gravity_kp)
+            wx += kp * ex
+            wy += kp * ey
+            wz += kp * ez
+            if in_protect:
+                bax += 2e-3 * (fx - fn * gbx_b)
+                bay += 2e-3 * (fy - fn * gby_b)
+                baz += 2e-3 * (fz - fn * gbz_b)
+                bgx -= 1e-4 * ex
+                bgy -= 1e-4 * ey
+                bgz -= 1e-4 * ez
+            grav_updates += 1
+
+        _quat_mul_right_rotvec(q, wx * dt, wy * dt, wz * dt)
+        awx, awy, awz = _rot_body_to_world(q, fx, fy, fz)
+        awz -= G
+        an = (awx * awx + awy * awy + awz * awz) ** 0.5
+        if an > 25.0:
+            s = 25.0 / an
+            awx *= s
+            awy *= s
+            awz *= s
+
+        # Raw integrate then 2nd-order velocity HP at decimated rate.
+        vx += awx * dt
+        vy += awy * dt
+        vz += awz * dt
+        alpha = 1.0 - float(np.exp(-dt / tau))
+        v_i = np.array([vx, vy, vz], dtype=np.float64)
+        v_lp1 = v_lp1 + alpha * (v_i - v_lp1)
+        v1 = v_i - v_lp1
+        v_lp2 = v_lp2 + alpha * (v1 - v_lp2)
+        v_hp = v1 - v_lp2
+        px += v_hp[0] * dt
+        py += v_hp[1] * dt
+        pz += v_hp[2] * dt
+
+        quat_d[k] = q
+        pos_d[k] = (px, py, pz)
+        vel_d[k] = v_hp
+
+    t_d = t_s[idx]
+    return {
+        "t_d": t_d,
+        "pos_d": pos_d,
+        "quat_d": quat_d,
+        "idx": idx,
+        "ba": np.array([bax, bay, baz]),
+        "bg": np.array([bgx, bgy, bgz]),
+        "q0": init["q0"],
+        "noisy_imu": init["noisy_imu"],
+        "grav_updates": grav_updates,
+        "decim_step": step,
+        "n_keyframes": m,
+    }

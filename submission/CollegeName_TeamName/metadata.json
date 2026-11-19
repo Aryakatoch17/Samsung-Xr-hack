@@ -1,29 +1,24 @@
 {
-  "n_samples": 7776,
-  "duration_s": 39.99500012397766,
-  "runtime_s": 0.3985298000043258,
-  "ms_per_imu_second": 9.964490530540107,
-  "peak_algorithm_bytes": 2434304,
-  "peak_algorithm_mb": 2.321533203125,
+  "n_samples": 35629,
+  "duration_s": 184.09500002861023,
+  "runtime_s": 0.7626792000082787,
+  "ms_per_imu_second": 4.142856676660152,
+  "peak_algorithm_bytes": 1860948,
+  "peak_algorithm_mb": 1.7747383117675781,
   "column_order_detected": "accel_gyro",
   "ts_unit": "ns",
   "acc_unit": "m/s^2",
-  "fail_start_idx": 6774,
+  "fail_start_idx": 34627,
   "n_failed": 1002,
-  "n_spikes": 7,
-  "n_stuck": 55,
-  "n_gaps": 7,
-  "n_dups": 10,
-  "gravity_updates": 400,
-  "coast_accel_world": [
-    0.0,
-    0.0,
-    0.0
-  ],
-  "coast_omega": [
-    0.0011105888083091252,
-    -0.0029480359547114426,
-    -0.025751122188705212
-  ],
-  "output": "outputs/synthetic/estimated_trajectory.txt"
+  "n_spikes": 25,
+  "n_stuck": 535,
+  "n_gaps": 27,
+  "n_dups": 49,
+  "gravity_updates": 31,
+  "vel_hp_tau_s": 0.35,
+  "att_hz": 50.0,
+  "gravity_aid": false,
+  "decim_step": 4,
+  "n_keyframes": 8908,
+  "output": "outputs\\MH_01_easy\\estimated_trajectory.txt"
 }

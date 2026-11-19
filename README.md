@@ -1,104 +1,74 @@
 # Track 03 — Path Finder
 
-6-DoF trajectory estimation from degraded IMU telemetry (Samsung XR Hackathon 2026).
+6-DoF trajectory from **degraded IMU only** (Samsung XR Hackathon 2026).
 
 ## Approach
 
-Offline **strapdown INS + complementary attitude/bias observer** with:
+- Per-file gyro/accel bias + protect-window gravity alignment (no EuRoC hard-codes)
+- Gyro attitude at ~50 Hz, upsampled to every row
+- Always integrate translation; **cascaded 2nd-order velocity high-pass** (`τ=0.35` s) hugs the stay-put floor
+- Blind last ~5 s: **hold** position and attitude
+- Exception-safe: any failure still writes a valid hold-pose trajectory (1 row / input row)
 
-- Gravity / gyro-bias init from the protected first ~2 s
-- Severity-aware gains matched to progressive jamming
-- Spike / stuck / duplicate gating
-- Gap coasting across missing rows
-- Zero-tail detection for the last ~5 s sensor failure + constrained dead reckoning
-- Second-pass re-integration with smoothed biases (smoother-like benefit, low memory)
-- Tuned to stay under **8 MB algorithm RAM** and **20 ms / 1 s IMU**
+## Quick start
 
-## Quick start (synthetic benchmark)
+```bash
+pip install -r requirements.txt
+# optional for local scoring: pip install evo matplotlib pandas
+
+python src/main.py path/to/degraded_imu.csv --out estimated_trajectory.txt --meta metadata.json
+python tools/validate_output.py path/to/degraded_imu.csv estimated_trajectory.txt
+```
+
+`main.py` also accepts a **folder** with `imu0/data.csv` (or `mav0/imu0/data.csv`) or a **zip** of that layout.
+
+### One-command bench
 
 ```bash
 python tools/run_synthetic_benchmark.py
+python tools/regression_gate.py --seeds 42,7,99
 ```
 
-Latest local numbers:
-- Clean ATE RMSE ≈ **0.003 m**
-- Degraded ATE RMSE ≈ **2.7 m** (organizer `degrade_imu.py`)
-- Runtime ≈ **11 ms / 1 s IMU**, algo mem ≈ **2.3 MB**
-
-## Real EuRoC
-
-ETH zip downloads often time out from some networks. Place files manually:
-
-```text
-data/euroc/MH_01_easy/imu.csv   # mav0/imu0/data.csv
-data/euroc/MH_01_easy/gt.csv    # mav0/state_groundtruth_estimate0/data.csv
-```
-
-Then:
+### Docker
 
 ```bash
-python tools/euroc_gt_to_tum.py data/euroc/MH_01_easy/gt.csv data/euroc/MH_01_easy/gt_tum.txt
-python tools/euroc_to_degrade_input.py data/euroc/MH_01_easy/imu.csv data/euroc/MH_01_easy/imu_accel_first.csv
-python degrade_imu.py data/euroc/MH_01_easy/imu_accel_first.csv data/euroc/MH_01_easy/imu_degraded.csv
-python src/main.py data/euroc/MH_01_easy/imu_degraded.csv --out outputs/euroc/estimated_trajectory.txt --meta outputs/euroc/metadata.json
-python tools/score_evo.py data/euroc/MH_01_easy/gt_tum.txt outputs/euroc/estimated_trajectory.txt --out-dir outputs/euroc/evo --no-plot
+docker build -t track3-pathfinder .
+docker run --rm track3-pathfinder
 ```
 
-`main.py` auto-detects EuRoC vs accel-first column order.
+## Constraints
 
-## Submission layout
+| Budget | Target (ours) |
+|---|---|
+| ≤8 MB algorithm heap | ~1.2–2.2 MB on MH |
+| ≤20 ms / 1 s IMU | ~4–6 ms/s |
+| 1 pose per IMU row | validated |
+| Python-only `main.py` | no scipy in estimator |
 
-```text
-team_name.zip
-├── estimated_trajectory.txt
-├── metadata.json
-└── src/
-    ├── main.py
-    └── README.md
-```
+## Results
 
-## Constraints (FAQ)
+See [`results.md`](results.md), [`NEGATIVE_RESULTS.md`](NEGATIVE_RESULTS.md), tag `v1-safe`.
 
-- Python only (`main.py`)
-- ≤ 8 MB algorithm heap (not process RSS)
-- ≤ 20 ms compute per 1 s of IMU
-- Exactly one output pose per input IMU row
-- Offline / non-causal smoothing allowed
-
-## Local benchmark (synthetic + degrade_imu.py)
-
-```bash
-python tools/run_synthetic_benchmark.py
-```
-
-Latest numbers:
-
-| Split | ATE RMSE (SE3 aligned) | Notes |
-|---|---|---|
-| Clean IMU | ~0.003 m | sanity check |
-| Degraded IMU | ~2.5 m | noise/bias/spikes/gaps + 5 s failure |
-| Runtime | ~10 ms / 1 s IMU | budget 20 |
-| Algo memory | ~2.3 MB | budget 8 |
-
-### Submission pack
+## Submission zip
 
 ```bash
 python tools/pack_submission.py --team CollegeName_TeamName \
-  --traj outputs/synthetic/estimated_trajectory.txt \
-  --meta outputs/synthetic/metadata.json
+  --traj outputs/MH_01_easy/estimated_trajectory.txt \
+  --meta outputs/MH_01_easy/metadata.json
 ```
-
-### Real EuRoC (when files are local)
-
-ETH download currently times out here. Put files at:
 
 ```text
-data/euroc/MH_01_easy/imu.csv   # from mav0/imu0/data.csv
-data/euroc/MH_01_easy/gt.csv    # from mav0/state_groundtruth_estimate0/data.csv
+CollegeName_TeamName.zip
+├── estimated_trajectory.txt
+├── metadata.json
+├── README.md
+└── src/
+    ├── main.py
+    └── ...
 ```
 
-Then:
+## Layout
 
-```bash
-python tools/run_euroc_local.py --seq-dir data/euroc/MH_01_easy
-```
+- `src/` — estimator (`main.py` entry)
+- `degrade_imu.py` — official degrader (local testing only)
+- `tools/` — gate, validator, horizon plot, scaling, packer

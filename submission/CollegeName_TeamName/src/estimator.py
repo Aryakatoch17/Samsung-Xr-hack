@@ -1,4 +1,4 @@
-"""Full Track-3 trajectory estimation pipeline."""
+"""Full Track-3 trajectory estimation pipeline (lean / flat-memory)."""
 
 from __future__ import annotations
 
@@ -7,9 +7,18 @@ from typing import Any
 
 import numpy as np
 
-from .fast_ins import reintegrate_fast, run_pass1, smooth_bias
-from .io_utils import load_imu_csv, write_tum_trajectory
+from .fast_ins import run_lean_ins
+from .io_utils import (
+    load_imu_csv,
+    write_hold_pose_trajectory,
+    write_tum_from_keyframes,
+)
 from .quality import analyze_imu
+
+# Cascaded (2nd-order) velocity high-pass time constant (seconds).
+# Tuned on MH01–03; validated on MH04–05. Not an EuRoC hard-code — data-driven.
+VEL_HP_TAU_S = 0.35
+ATT_HZ = 50.0
 
 
 def _estimate_peak_algorithm_bytes(arrays: list[np.ndarray]) -> int:
@@ -18,13 +27,25 @@ def _estimate_peak_algorithm_bytes(arrays: list[np.ndarray]) -> int:
     return total
 
 
-def run_estimator(imu_csv: str, out_traj: str) -> dict[str, Any]:
+def run_estimator(
+    imu_csv: str,
+    out_traj: str,
+    vel_hp_tau_s: float = VEL_HP_TAU_S,
+    att_hz: float = ATT_HZ,
+    gravity_aid: bool = False,
+    gravity_kp: float = 0.05,
+) -> dict[str, Any]:
     t_wall0 = time.perf_counter()
+
     imu = load_imu_csv(imu_csv)
     t_s = imu["t_s"]
-    gyro = imu["gyro"]
-    accel = imu["accel"]
+    order = imu["order"]
+    ts_unit = imu["ts_unit"]
+    acc_unit = imu["acc_unit"]
     n = imu["n"]
+    gyro = np.asarray(imu["gyro"], dtype=np.float32)
+    accel = np.asarray(imu["accel"], dtype=np.float32)
+    del imu
     duration = float(t_s[-1] - t_s[0]) if n > 1 else 0.0
 
     qual = analyze_imu(t_s, accel, gyro)
@@ -32,76 +53,57 @@ def run_estimator(imu_csv: str, out_traj: str) -> dict[str, Any]:
     failed = qual["failed"]
     gap = qual["gap"]
     dup = qual["dup"]
-    spike = qual["spike"]
-    stuck = qual["stuck"]
 
-    pass1 = run_pass1(t_s, gyro, accel, usable, failed, gap, dup)
-
-    ba_s = smooth_bias(pass1["ba"], usable & ~failed, win=51)
-    bg_s = smooth_bias(pass1["bg"], usable & ~failed, win=51)
-    if failed.any():
-        fs = qual["fail_start_idx"]
-        if fs > 0:
-            ba_s[fs:] = ba_s[fs - 1]
-            bg_s[fs:] = bg_s[fs - 1]
-
-    # Blind 5 s: constant-velocity coast (a=0). Noisy pre-fail accel hurts more than it helps
-    # over a 5 s open-loop window (0.5*a*t^2). Keep a robust angular-rate prior.
-    fs = qual["fail_start_idx"]
-    coast_a = np.zeros(3)
-    if fs < n and fs > 0:
-        t_lo = t_s[fs] - 1.0
-        mask = (t_s >= t_lo) & (t_s < t_s[fs]) & usable & ~failed
-        if int(mask.sum()) >= 10:
-            ww = pass1["omega"][mask]
-            coast_w = np.median(ww, axis=0)
-            # reject absurd spin
-            if float(np.linalg.norm(coast_w)) > 1.5:
-                coast_w = pass1["omega"][fs - 1].copy()
-        else:
-            coast_w = pass1["omega"][fs - 1].copy()
-    else:
-        coast_w = pass1["omega"][-1].copy()
-
-    wn = float(np.linalg.norm(coast_w))
-    if wn > 1.5:
-        coast_w = coast_w * (1.5 / wn)
-
-    pos, vel, quat = reintegrate_fast(
+    lean = run_lean_ins(
         t_s,
         gyro,
         accel,
-        pass1["q0"],
-        ba_s,
-        bg_s,
         usable,
         failed,
         gap,
         dup,
-        coast_a,
-        coast_w,
+        vel_hp_tau_s=vel_hp_tau_s,
+        att_hz=att_hz,
+        gravity_aid=gravity_aid,
+        gravity_kp=gravity_kp,
     )
 
-    write_tum_trajectory(out_traj, t_s, pos, quat)
+    n_failed = int(failed.sum())
+    n_spikes = int(qual["spike"].sum())
+    n_stuck = int(qual["stuck"].sum())
+    n_gaps = int(gap.sum())
+    n_dups = int(dup.sum())
+    fail_start_idx = qual["fail_start_idx"]
 
-    elapsed = time.perf_counter() - t_wall0
+    # Peak working set before freeing sensors: timestamps + sensors + keyframes + flags.
     peak_bytes = _estimate_peak_algorithm_bytes(
         [
             t_s,
             gyro,
             accel,
-            pass1["ba"],
-            pass1["bg"],
-            pass1["quat"],
-            pass1["a_w"],
-            pass1["omega"],
-            ba_s,
-            bg_s,
-            pos,
-            vel,
-            quat,
+            lean["pos_d"],
+            lean["quat_d"],
+            lean["t_d"],
+            usable,
+            failed,
+            gap,
+            dup,
         ]
     )
+
+    write_tum_from_keyframes(
+        out_traj,
+        t_s,
+        lean["t_d"],
+        lean["pos_d"],
+        lean["quat_d"],
+        failed,
+        dup,
+    )
+
+    del gyro, accel, usable, failed, gap, dup, qual
+
+    elapsed = time.perf_counter() - t_wall0
     ms_per_s = (elapsed * 1000.0) / max(duration, 1e-6)
 
     return {
@@ -111,17 +113,42 @@ def run_estimator(imu_csv: str, out_traj: str) -> dict[str, Any]:
         "ms_per_imu_second": ms_per_s,
         "peak_algorithm_bytes": peak_bytes,
         "peak_algorithm_mb": peak_bytes / (1024 * 1024),
-        "column_order_detected": imu["order"],
-        "ts_unit": imu["ts_unit"],
-        "acc_unit": imu["acc_unit"],
-        "fail_start_idx": qual["fail_start_idx"],
-        "n_failed": int(failed.sum()),
-        "n_spikes": int(spike.sum()),
-        "n_stuck": int(stuck.sum()),
-        "n_gaps": int(gap.sum()),
-        "n_dups": int(dup.sum()),
-        "gravity_updates": int(pass1["grav_updates"]),
-        "coast_accel_world": coast_a.tolist(),
-        "coast_omega": coast_w.tolist(),
+        "column_order_detected": order,
+        "ts_unit": ts_unit,
+        "acc_unit": acc_unit,
+        "fail_start_idx": fail_start_idx,
+        "n_failed": n_failed,
+        "n_spikes": n_spikes,
+        "n_stuck": n_stuck,
+        "n_gaps": n_gaps,
+        "n_dups": n_dups,
+        "gravity_updates": int(lean["grav_updates"]),
+        "vel_hp_tau_s": float(vel_hp_tau_s),
+        "att_hz": float(att_hz),
+        "gravity_aid": bool(gravity_aid),
+        "decim_step": int(lean["decim_step"]),
+        "n_keyframes": int(lean["n_keyframes"]),
+        "output": out_traj,
+    }
+
+
+def run_hold_pose_fallback(imu_csv: str, out_traj: str, err: str | None = None) -> dict[str, Any]:
+    """Always-valid output: one hold pose per input row (Umeyama-safe tiny quat drip)."""
+    t_wall0 = time.perf_counter()
+    imu = load_imu_csv(imu_csv)
+    t_s = imu["t_s"]
+    n = imu["n"]
+    duration = float(t_s[-1] - t_s[0]) if n > 1 else 0.0
+    write_hold_pose_trajectory(out_traj, t_s)
+    elapsed = time.perf_counter() - t_wall0
+    return {
+        "n_samples": n,
+        "duration_s": duration,
+        "runtime_s": elapsed,
+        "ms_per_imu_second": (elapsed * 1000.0) / max(duration, 1e-6),
+        "peak_algorithm_bytes": int(t_s.nbytes + 8192),
+        "peak_algorithm_mb": (t_s.nbytes + 8192) / (1024 * 1024),
+        "fallback": True,
+        "fallback_error": err,
         "output": out_traj,
     }

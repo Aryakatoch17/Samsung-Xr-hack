@@ -61,7 +61,11 @@ def main() -> int:
         if p.exists():
             shutil.copy2(p, src_out / name)
 
-    # Ensure main.py is runnable from inside src/
+    # Root README for judges
+    readme = ROOT / "README.md"
+    if readme.exists():
+        shutil.copy2(readme, out_dir / "README.md")
+
     zip_path = ROOT / args.out_dir / f"{args.team}.zip"
     if zip_path.exists():
         zip_path.unlink()
