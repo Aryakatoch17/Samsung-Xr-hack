@@ -87,13 +87,13 @@ See [`results.md`](results.md), [`NEGATIVE_RESULTS.md`](NEGATIVE_RESULTS.md). Re
 ## Submission zip
 
 ```bash
-python tools/pack_submission.py --team CollegeName_TeamName \
+python tools/pack_submission.py --team "SRMIST KTR_2 fast 2 curious" \
   --traj outputs/MH_01_easy/estimated_trajectory.txt \
   --meta outputs/MH_01_easy/metadata.json
 ```
 
 ```text
-CollegeName_TeamName.zip
+SRMIST KTR_2 fast 2 curious.zip
 ├── estimated_trajectory.txt
 ├── metadata.json
 ├── README.md
@@ -108,7 +108,7 @@ CollegeName_TeamName.zip
     └── README.md
 ```
 
-Rename `CollegeName_TeamName` to your real college/team before upload.
+Team: **SRMIST KTR_2 fast 2 curious** (Track 03 Path Finder).
 
 ## Layout
 

@@ -12,12 +12,15 @@ from pptx.util import Emu, Inches, Pt
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "Submission_Final_forGithub.pptx"
 OUT = ROOT / "Submission_Final_forGithub.pptx"
-COPY = ROOT / "submission" / "CollegeName_TeamName.pptx"
+# Fallback when the main file is locked open in PowerPoint.
+OUT_ALT = ROOT / "Submission_Final_readable.pptx"
+COPY = ROOT / "submission" / "SRMIST KTR_2 fast 2 curious.pptx"
 
-NAVY = RGBColor(0x0B, 0x1F, 0x3A)
-TEAL = RGBColor(0x0E, 0x7C, 0x7B)
-BODY = RGBColor(0x1A, 0x1A, 0x1A)
-MUTED = RGBColor(0x4A, 0x55, 0x68)
+# Slide background is near-black (#0A0E1A) — keep all readable text light.
+NAVY = RGBColor(0xE8, 0xEE, 0xF8)   # light headings (was dark navy)
+TEAL = RGBColor(0x5E, 0xE7, 0xF0)   # bright cyan accent
+BODY = RGBColor(0xF2, 0xF5, 0xFA)   # primary body
+MUTED = RGBColor(0xB0, 0xBC, 0xD0)  # secondary / captions
 WHITE = RGBColor(0xFF, 0xFF, 0xFF)
 
 
@@ -58,29 +61,71 @@ def _add_body(slide, left, top, width, height, blocks: list[tuple[str, bool, int
     return box
 
 
+def _strip_textboxes(slide) -> None:
+    """Remove previously injected text boxes so fills do not stack/duplicate."""
+    for sh in list(slide.shapes):
+        if sh.has_text_frame and sh.name.startswith("TextBox"):
+            el = sh._element
+            el.getparent().remove(el)
+        elif sh.has_text_frame and getattr(sh, "shape_type", None) is not None:
+            # python-pptx: TEXT_BOX == 17
+            try:
+                if int(sh.shape_type) == 17:
+                    el = sh._element
+                    el.getparent().remove(el)
+            except Exception:
+                pass
+
+
+def _recolor_all_text(slide) -> None:
+    """Force every run on the slide to a light-on-dark palette."""
+    for sh in slide.shapes:
+        if not sh.has_text_frame:
+            continue
+        for p in sh.text_frame.paragraphs:
+            for r in p.runs:
+                if not r.text:
+                    continue
+                bold = bool(r.font.bold)
+                size_pt = (r.font.size.pt if r.font.size else 14)
+                if size_pt >= 28:
+                    r.font.color.rgb = WHITE
+                elif bold and size_pt >= 15:
+                    r.font.color.rgb = TEAL
+                elif bold:
+                    r.font.color.rgb = NAVY
+                else:
+                    r.font.color.rgb = BODY if size_pt >= 12 else MUTED
+
+
 def fill_title(slide) -> None:
+    _strip_textboxes(slide)
     # Track No badge text
     for sh in slide.shapes:
-        if sh.has_text_frame and sh.text_frame.text.strip() == "Track No":
-            _replace_title(sh, "Track 03", size=18, color=WHITE)
-        elif sh.has_text_frame and sh.text_frame.text.strip().startswith("XR Hackathon"):
+        if not sh.has_text_frame:
+            continue
+        raw = sh.text_frame.text.strip()
+        if raw in ("Track No", "Track 03") or raw.startswith("Track 03"):
+            if "Path Finder" not in raw and len(raw) < 20:
+                _replace_title(sh, "Track 03", size=18, color=WHITE)
+        elif raw.startswith("XR Hackathon") or raw.startswith("Path Finder"):
             _set_runs(
                 sh,
                 [
-                    ("XR Hackathon 2026", True, 36, NAVY),
+                    ("XR Hackathon 2026", True, 36, WHITE),
                     ("Path Finder — IMU-only 6-DoF", True, 22, TEAL),
                     ("Never below the stay-put floor · win on rotation & efficiency", False, 14, MUTED),
                 ],
             )
-        elif sh.has_text_frame and "Team Name" in sh.text_frame.text:
+        elif "Team" in raw and ("College" in raw or "TeamName" in raw or "Team Name" in raw):
             _set_runs(
                 sh,
                 [
-                    ("Team: [TeamName]    College: [CollegeName]", True, 18, NAVY),
-                    ("Rename placeholders before upload (CollegeName_TeamName)", False, 12, MUTED),
+                    ("Team: 2 fast 2 curious    College: SRMIST KTR", True, 18, WHITE),
+                    ("Submission: SRMIST KTR_2 fast 2 curious", False, 12, MUTED),
                 ],
             )
-        elif sh.has_text_frame and sh.text_frame.text.strip() == "Members Details":
+        elif raw.startswith("Members"):
             _set_runs(
                 sh,
                 [
@@ -89,9 +134,11 @@ def fill_title(slide) -> None:
                     ("[Name 3]  ·  [Name 4]", False, 13, BODY),
                 ],
             )
+    _recolor_all_text(slide)
 
 
 def fill_problem(slide) -> None:
+    _strip_textboxes(slide)
     _replace_title(slide.shapes[2], "THE PROBLEM")
     _add_body(
         slide,
@@ -131,6 +178,7 @@ def fill_problem(slide) -> None:
 
 
 def fill_solution(slide) -> None:
+    _strip_textboxes(slide)
     _replace_title(slide.shapes[2], "SOLUTION")
     _add_body(
         slide,
@@ -168,6 +216,7 @@ def fill_solution(slide) -> None:
 
 
 def fill_architecture(slide) -> None:
+    _strip_textboxes(slide)
     _replace_title(slide.shapes[2], "ARCHITECTURE")
     _add_body(
         slide,
@@ -196,6 +245,7 @@ def fill_architecture(slide) -> None:
 
 
 def fill_results(slide) -> None:
+    _strip_textboxes(slide)
     _replace_title(slide.shapes[2], "RESULTS & TRACK OUTPUT")
     _add_body(
         slide,
@@ -215,13 +265,14 @@ def fill_results(slide) -> None:
             ("Heap      tracemalloc ~2–3.5 MB on MH01 (≤8 MB algorithm heap)", False, 12, BODY),
             ("", False, 6, BODY),
             ("Submission bundle (Slide 17)", True, 14, NAVY),
-            ("CollegeName_TeamName.zip → estimated_trajectory.txt · metadata.json · src/main.py", False, 12, BODY),
+            ("SRMIST KTR_2 fast 2 curious.zip → estimated_trajectory.txt · metadata.json · src/main.py", False, 12, BODY),
             ("Evaluated with evo (Umeyama ATE / RPE) against hidden GT", False, 12, MUTED),
         ],
     )
 
 
 def fill_diff(slide) -> None:
+    _strip_textboxes(slide)
     _replace_title(slide.shapes[2], "DIFFERENTIATION")
     _add_body(
         slide,
@@ -251,12 +302,8 @@ def fill_diff(slide) -> None:
 
 
 def fill_demo(slide) -> None:
+    _strip_textboxes(slide)
     _replace_title(slide.shapes[2], "DEMO & LOCAL SETUP")
-    # clear stray empty textbox if present
-    for sh in list(slide.shapes):
-        if sh.has_text_frame and sh.text_frame.text.strip() == "" and sh.name.startswith("Text Box"):
-            sp = sh._element
-            sp.getparent().remove(sp)
     _add_body(
         slide,
         Inches(0.4),
@@ -274,7 +321,7 @@ def fill_demo(slide) -> None:
             ("", False, 4, BODY),
             ("Reproduce gate / pack", True, 14, TEAL),
             ("python tools/regression_gate.py --seeds 42,7,99          # expect 15/15", False, 11, BODY),
-            ("python tools/pack_submission.py --team CollegeName_TeamName \\", False, 11, BODY),
+            ("python tools/pack_submission.py --team \"SRMIST KTR_2 fast 2 curious\" \\", False, 11, BODY),
             ("    --traj outputs/MH_01_easy/estimated_trajectory.txt --meta outputs/MH_01_easy/metadata.json", False, 11, BODY),
             ("", False, 4, BODY),
             ("Inputs accepted: CSV · folder with imu0/data.csv · zip of that layout", False, 12, MUTED),
@@ -283,11 +330,8 @@ def fill_demo(slide) -> None:
 
 
 def fill_brownie(slide) -> None:
+    _strip_textboxes(slide)
     _replace_title(slide.shapes[2], "LEARNINGS & NEGATIVE RESULTS")
-    for sh in list(slide.shapes):
-        if sh.has_text_frame and sh.text_frame.text.strip() == "" and sh.name.startswith("Text Box"):
-            sp = sh._element
-            sp.getparent().remove(sp)
     _add_body(
         slide,
         Inches(0.4),
@@ -316,12 +360,13 @@ def fill_brownie(slide) -> None:
 
 
 def fill_thanks(slide) -> None:
+    _strip_textboxes(slide)
     for sh in slide.shapes:
         if sh.has_text_frame and "Thank You" in sh.text_frame.text:
             _set_runs(
                 sh,
                 [
-                    ("Thank You", True, 40, NAVY),
+                    ("Thank You", True, 40, WHITE),
                 ],
                 align=PP_ALIGN.CENTER,
             )
@@ -333,7 +378,7 @@ def fill_thanks(slide) -> None:
         Inches(1.2),
         [
             ("Track 03 · Path Finder", True, 16, TEAL),
-            ("[CollegeName]  ·  [TeamName]  ·  Samsung XR Hackathon 2026", False, 13, MUTED),
+            ("SRMIST KTR  ·  2 fast 2 curious  ·  Samsung XR Hackathon 2026", False, 13, MUTED),
             ("Questions?  prism@samsung.com", False, 12, MUTED),
         ],
     )
@@ -342,10 +387,15 @@ def fill_thanks(slide) -> None:
         if sh.has_text_frame and "Track 03" in sh.text_frame.text:
             for p in sh.text_frame.paragraphs:
                 p.alignment = PP_ALIGN.CENTER
+    _recolor_all_text(slide)
 
 
 def main() -> int:
-    prs = Presentation(str(SRC))
+    # Prefer unlocked copies first (original is often open in PowerPoint).
+    src = next((p for p in (OUT_ALT, COPY, SRC) if p.exists()), SRC)
+    prs = Presentation(str(src))
+    print(f"loaded {src}")
+
     fill_title(prs.slides[0])
     fill_problem(prs.slides[1])
     fill_solution(prs.slides[2])
@@ -355,12 +405,23 @@ def main() -> int:
     fill_demo(prs.slides[6])
     fill_brownie(prs.slides[7])
     fill_thanks(prs.slides[8])
-    prs.save(str(OUT))
+    for slide in prs.slides:
+        _recolor_all_text(slide)
     COPY.parent.mkdir(parents=True, exist_ok=True)
-    prs.save(str(COPY))
-    print(f"wrote {OUT}")
-    print(f"wrote {COPY}")
-    print("Fill [CollegeName], [TeamName], and member names on slide 1 before upload.")
+    saved = []
+    for path in (OUT, COPY, OUT_ALT):
+        try:
+            prs.save(str(path))
+            saved.append(path)
+        except PermissionError:
+            print(f"locked, skipped: {path}")
+    if not saved:
+        raise SystemExit(
+            "Could not save any PPTX — close PowerPoint (and delete ~$ lock files) then re-run."
+        )
+    for path in saved:
+        print(f"wrote {path}")
+    print("Team set to SRMIST KTR_2 fast 2 curious — fill member names on slide 1 if needed.")
     return 0
 
 

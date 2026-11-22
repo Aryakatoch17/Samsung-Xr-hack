@@ -2,7 +2,7 @@
 machine_hall.zip
 _pptx.zip
 *.zip
-!submission/CollegeName_TeamName.zip
+!submission/SRMIST KTR_2 fast 2 curious.zip
 data/euroc/**
 !data/euroc/.gitkeep
 data/synthetic/**
@@ -14,6 +14,13 @@ data/degrade_meta.json
 outputs/**
 !outputs/.gitkeep
 *.pptx
+!/SRMIST KTR_2 fast 2 curious.pptx
+submission/*.pptx
+# Keep only the final demo video on GitHub (under 100MB hard limit)
+video_assets/
+Recording*.mp4
+!demo.mp4
+!SRMIST_KTR_2_fast_2_curious_demo.mp4
 
 # Python
 __pycache__/
