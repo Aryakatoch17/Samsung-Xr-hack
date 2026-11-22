@@ -7,7 +7,7 @@ Fails if (any seed, any sequence):
   last-5s > 1.10x stay-put
   RPE-rot or ATE-rot gain drops >10% vs locked baseline
   runtime > 10 ms/s
-  tracemalloc peak > 5 MB
+  algo account heap > 5 MB (FAQ ≤8; tracemalloc/RSS logged separately)
 
 Usage:
   python tools/regression_gate.py [--seeds 42,7,99] [--seqs MH_01_easy,...]
@@ -18,7 +18,6 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-import tracemalloc
 from copy import deepcopy
 from pathlib import Path
 
@@ -81,7 +80,7 @@ def check_row(m: dict, seq: str, ms_per_s: float, peak_mb: float) -> list[str]:
     if ms_per_s > 10.0:
         fails.append(f"runtime {ms_per_s:.2f} ms/s > 10")
     if peak_mb > 5.0:
-        fails.append(f"tracemalloc peak {peak_mb:.2f} MB > 5")
+        fails.append(f"algo account {peak_mb:.2f} MB > 5")
     return fails
 
 
@@ -115,18 +114,22 @@ def main() -> int:
             est = work / f"est_seed{seed}.txt"
             degrade_to_file(accel_first, deg, seed, cfg)
 
-            # Time WITHOUT tracemalloc (tracing inflates runtime 10×+).
-            meta = run_estimator(str(deg), str(est))
+            # Timed pass: no internal tracemalloc second-pass (keeps ms/s honest).
+            meta = run_estimator(str(deg), str(est), measure_tracemalloc=False)
             ms = float(meta["ms_per_imu_second"])
             account_mb = float(meta["peak_algorithm_mb"])
-            # One tracemalloc sample per sequence (seed 42 only) — info, not timing.
+            rss_mb = meta.get("rss_delta_mb")
+            # One dual-heap sample per sequence (seed 42 only).
             trace_mb = float("nan")
             if seed == seeds[0]:
-                tracemalloc.start()
-                _ = run_estimator(str(deg), str(work / f"_trace_seed{seed}.txt"))
-                _cur, peak = tracemalloc.get_traced_memory()
-                tracemalloc.stop()
-                trace_mb = peak / (1024 * 1024)
+                meta_tm = run_estimator(
+                    str(deg),
+                    str(work / f"_trace_seed{seed}.txt"),
+                    measure_tracemalloc=True,
+                )
+                trace_mb = float(meta_tm.get("tracemalloc_peak_mb") or float("nan"))
+                if rss_mb is None:
+                    rss_mb = meta_tm.get("rss_delta_mb")
 
             m = evaluate_pair(str(gt), str(est))
             fails = check_row(m, seq, ms, account_mb)  # FAQ algorithm heap
@@ -134,8 +137,10 @@ def main() -> int:
                 "seq": seq,
                 "seed": seed,
                 "ms_per_s": round(ms, 3),
-                "tracemalloc_peak_mb": round(trace_mb, 3),
+                "tracemalloc_peak_mb": round(trace_mb, 3) if trace_mb == trace_mb else None,
+                "rss_delta_mb": None if rss_mb is None else round(float(rss_mb), 3),
                 "algo_account_mb": round(account_mb, 3),
+                "sensor_storage": meta.get("sensor_storage"),
                 **{k: round(float(v), 4) for k, v in m.items()},
                 "fails": fails,
                 "pass": len(fails) == 0,
@@ -146,7 +151,9 @@ def main() -> int:
                 f"[{status}] {seq} seed={seed} ATE={m['ate']:.3f}/{m['stayput_ate']:.3f} "
                 f"RPE={m['rpe_1s']:.3f} B5={m['blind5']:.3f} "
                 f"Rrot={m['rpe_rot_deg']:.2f}° (gain {m['rpe_rot_gain']:.1f}x) "
-                f"{ms:.2f} ms/s  acct={account_mb:.2f} MB  trace={trace_mb:.2f} MB"
+                f"{ms:.2f} ms/s  acct={account_mb:.2f} MB  "
+                f"tm={trace_mb if trace_mb == trace_mb else float('nan'):.2f} MB  "
+                f"rssΔ={rss_mb if rss_mb is not None else float('nan'):.2f} MB"
             )
             for f in fails:
                 print(f"    - {f}")

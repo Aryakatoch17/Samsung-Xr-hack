@@ -1,5 +1,6 @@
+# Required for src/main.py (measured path is numpy-only).
 numpy>=1.24
-# pandas only needed for degrade_imu.py / local gates, not for main.py
+# Local testing / official degrader / gates only — not imported by main.py.
 pandas>=2.0
 # optional scoring / plots (not imported by src/main.py)
 # evo

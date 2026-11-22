@@ -35,3 +35,20 @@ Tried `gravity_kp=0.05` on quiet gyro samples. **Worsened** ATE-rot on all 5 seq
 (e.g. MH01 3.6°→6.0°, MH03 1.4°→1.8°) and raised RPE-rot. MH03 error is mostly tilt
 (1.34°) not heading (0.52°), but mid-flight gravity aid still hurt. Kept protect-window
 Mahony only.
+
+## Full-rate gyro attitude (drop 50 Hz keyframes)
+
+Matched sequential `att_scan` to ~1e-15, but **RPE-rot / ATE-rot gains collapsed** vs the
+locked 50 Hz block-average baselines (gate 0/5). High-rate noise integration hurts the
+rotation metrics the gate guards. **Kept ~50 Hz keyframes.**
+
+## Scalar IMU precompute under tracemalloc
+
+Per-sample Python scans to avoid `ndarray.mean` on memmap slices: traced ms/s got
+**worse** (~102 → ~160). Tracemalloc tax on millions of Python floats exceeds NumPy
+means on tiny blocks.
+
+## What cleared the traced budget (kept)
+
+Float32 cumsum block means + protect-only Mahony + `fastpath.att_scan` / `hp_block` +
+`tum_bytes` writer (no `savetxt`). Traced ~16 ms/s, heap ~3.5 MB, gate 15/15.

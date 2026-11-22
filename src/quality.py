@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import numpy as np
 
+_CHUNK = 8192
+
 
 def analyze_imu(
     t_s: np.ndarray,
@@ -14,63 +16,73 @@ def analyze_imu(
     failure_min_seconds: float = 1.0,
 ) -> dict:
     n = len(t_s)
-    dt = np.empty(n, dtype=np.float64)
-    dt[0] = np.median(np.diff(t_s)) if n > 1 else 0.005
-    dt[1:] = np.diff(t_s)
-
-    med_dt = float(np.nanmedian(dt[1:])) if n > 1 else 0.005
-    if not np.isfinite(med_dt) or med_dt <= 0:
+    # dt without a lasting full copy beyond this function's peak overlap.
+    if n > 1:
+        d = np.diff(t_s)
+        med_dt = float(np.nanmedian(d))
+        if not np.isfinite(med_dt) or med_dt <= 0:
+            med_dt = 0.005
+        med_dt = max(med_dt, 1e-4)
+        dup = np.zeros(n, dtype=bool)
+        gap = np.zeros(n, dtype=bool)
+        dup[1:] = d <= 1e-9
+        gap[1:] = d > (3.5 * med_dt)
+        del d
+    else:
         med_dt = 0.005
-    med_dt = max(med_dt, 1e-4)
+        dup = np.zeros(n, dtype=bool)
+        gap = np.zeros(n, dtype=bool)
 
-    # Duplicates / non-positive dt
-    dup = dt <= 1e-9
-    dup[0] = False
-
-    # Gaps: missing rows -> large dt jumps (script bursts are 5-50 samples)
-    gap = dt > (3.5 * med_dt)
-    gap[0] = False
-
-    # Stuck: short freezes (degrade_imu stuck_len is 2..10). Long identical
-    # stretches are real static segments, NOT sensor faults.
+    # Stuck: chunked pairwise compare — never allocate full (n,3) diff.
     stuck = np.zeros(n, dtype=bool)
     if n > 1:
-        same = np.all(np.abs(accel[1:] - accel[:-1]) < 1e-9, axis=1) & np.all(
-            np.abs(gyro[1:] - gyro[:-1]) < 1e-9, axis=1
-        )
-        # mark runs of identical samples with length in [2, 15]
-        i = 0
-        while i < len(same):
-            if not same[i]:
-                i += 1
-                continue
-            j = i
-            while j < len(same) and same[j]:
-                j += 1
-            run = j - i + 1  # includes the first repeated sample at i+1.. 
-            # same[k] True means sample k+1 equals sample k; run length in samples ≈ j-i+1
-            if 2 <= run <= 15:
-                stuck[i + 1 : j + 1] = True
-            i = j
+        for start in range(0, n - 1, _CHUNK):
+            end = min(n - 1, start + _CHUNK)
+            same = np.all(
+                np.abs(accel[start + 1 : end + 1] - accel[start:end]) < 1e-9, axis=1
+            ) & np.all(
+                np.abs(gyro[start + 1 : end + 1] - gyro[start:end]) < 1e-9, axis=1
+            )
+            i = 0
+            while i < len(same):
+                if not same[i]:
+                    i += 1
+                    continue
+                j = i
+                while j < len(same) and same[j]:
+                    j += 1
+                run = j - i + 1
+                if 2 <= run <= 15:
+                    stuck[start + i + 1 : start + j + 1] = True
+                i = j
 
-    # Spikes relative to local robust scale (skip early protect window later in filter)
-    a_norm = np.linalg.norm(accel, axis=1)
-    g_norm = np.linalg.norm(gyro, axis=1)
-    # Use rolling-ish robust thresholds via percentiles on protected region first
+    # One float32 norm buffer at a time (reuse) to avoid 2×N live norms.
+    norm = np.empty(n, dtype=np.float32)
+    for start in range(0, n, _CHUNK):
+        end = min(n, start + _CHUNK)
+        norm[start:end] = np.linalg.norm(accel[start:end], axis=1)
+
     t0 = t_s[0]
-    prot = t_s <= (t0 + protect_seconds)
-    if prot.sum() < 10:
-        prot = np.ones(n, dtype=bool)
-        prot[min(n - 1, 50) :] = False if n > 50 else prot
+    n_prot = int(np.searchsorted(t_s, t0 + protect_seconds, side="right"))
+    if n_prot < 10:
+        n_prot = min(n, 50)
+    prot_sl = slice(0, n_prot)
 
-    a_ref = float(np.median(a_norm[prot])) if prot.any() else 9.81
-    g_ref = float(np.median(g_norm[prot])) if prot.any() else 0.0
-    a_mad = float(np.median(np.abs(a_norm[prot] - a_ref))) + 1e-6
-    g_mad = float(np.median(np.abs(g_norm[prot] - g_ref))) + 1e-6
+    a_ref = float(np.median(norm[prot_sl])) if n_prot else 9.81
+    a_mad = float(np.median(np.abs(norm[prot_sl] - a_ref))) + 1e-6
+    a_spike = np.abs(norm - a_ref) > max(3.5, 10.0 * a_mad)
+    near_zero_a = norm < failure_norm_thresh
 
-    # Sensor failure first: trailing region where both norms ~ 0 (degrade_imu zeros last 5s)
+    for start in range(0, n, _CHUNK):
+        end = min(n, start + _CHUNK)
+        norm[start:end] = np.linalg.norm(gyro[start:end], axis=1)
+    g_ref = float(np.median(norm[prot_sl])) if n_prot else 0.0
+    g_mad = float(np.median(np.abs(norm[prot_sl] - g_ref))) + 1e-6
+    g_spike = np.abs(norm - g_ref) > max(0.6, 10.0 * g_mad)
+    near_zero = near_zero_a & (norm < failure_norm_thresh)
+    del near_zero_a
+
     failed = np.zeros(n, dtype=bool)
-    near_zero = (a_norm < failure_norm_thresh) & (g_norm < failure_norm_thresh)
     i = n - 1
     while i >= 0 and near_zero[i]:
         i -= 1
@@ -79,22 +91,17 @@ def analyze_imu(
         failed[fail_start:] = True
     elif (
         fail_start < n
-        and near_zero[fail_start:].mean() > 0.95
+        and float(near_zero[fail_start:].mean()) > 0.95
         and (n - fail_start) > int(0.5 / med_dt)
     ):
         failed[fail_start:] = True
 
-    spike = (
-        (np.abs(a_norm - a_ref) > max(3.5, 10.0 * a_mad))
-        | (np.abs(g_norm - g_ref) > max(0.6, 10.0 * g_mad))
-    ) & ~failed & ~near_zero
+    spike = (a_spike | g_spike) & ~failed & ~near_zero
+    del a_spike, g_spike, near_zero, norm
 
     stuck = stuck & ~failed
     usable = ~(dup | stuck | spike | failed)
-    # gaps themselves are not invalid samples — the sample after a gap is usable
-    # but we flag gap for coast logic
     return {
-        "dt": dt,
         "med_dt": med_dt,
         "dup": dup,
         "gap": gap,
@@ -103,6 +110,4 @@ def analyze_imu(
         "failed": failed,
         "usable": usable,
         "fail_start_idx": int(fail_start) if failed.any() else n,
-        "a_norm": a_norm,
-        "g_norm": g_norm,
     }

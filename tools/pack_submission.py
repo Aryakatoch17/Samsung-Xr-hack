@@ -5,6 +5,7 @@ Build Track-3 submission zip:
   team_name.zip
   ├── estimated_trajectory.txt
   ├── metadata.json
+  ├── README.md
   └── src/
       ├── main.py
       ├── ...
@@ -19,14 +20,16 @@ import zipfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+
+# Live estimator only — no legacy EKF / unused math modules.
 SRC_FILES = [
     "main.py",
     "estimator.py",
     "fast_ins.py",
+    "fastpath.py",
     "quality.py",
     "io_utils.py",
-    "math_utils.py",
-    "ins_ekf.py",
+    "mem_utils.py",
     "__init__.py",
     "README.md",
 ]
@@ -35,8 +38,8 @@ SRC_FILES = [
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--team", required=True, help="CollegeName_TeamName")
-    ap.add_argument("--traj", default="outputs/synthetic/estimated_trajectory.txt")
-    ap.add_argument("--meta", default="outputs/synthetic/metadata.json")
+    ap.add_argument("--traj", default="outputs/MH_01_easy/estimated_trajectory.txt")
+    ap.add_argument("--meta", default="outputs/MH_01_easy/metadata.json")
     ap.add_argument("--out-dir", default="submission")
     args = ap.parse_args()
 
@@ -52,16 +55,27 @@ def main() -> int:
         raise SystemExit(f"missing trajectory: {traj}")
     shutil.copy2(traj, out_dir / "estimated_trajectory.txt")
     if meta.exists():
-        shutil.copy2(meta, out_dir / "metadata.json")
-    else:
-        (out_dir / "metadata.json").write_text("{}", encoding="utf-8")
+        import json
 
+        payload = json.loads(meta.read_text(encoding="utf-8"))
+        # Never ship absolute local paths in the zip.
+        payload["output"] = "estimated_trajectory.txt"
+        (out_dir / "metadata.json").write_text(
+            json.dumps(payload, indent=2) + "\n", encoding="utf-8"
+        )
+    else:
+        (out_dir / "metadata.json").write_text("{}\n", encoding="utf-8")
+
+    missing = []
     for name in SRC_FILES:
         p = ROOT / "src" / name
         if p.exists():
             shutil.copy2(p, src_out / name)
+        else:
+            missing.append(name)
+    if missing:
+        raise SystemExit(f"missing src files required for pack: {missing}")
 
-    # Root README for judges
     readme = ROOT / "README.md"
     if readme.exists():
         shutil.copy2(readme, out_dir / "README.md")
@@ -76,6 +90,7 @@ def main() -> int:
 
     print(f"wrote {zip_path}")
     print(f"folder {out_dir}")
+    print("src:", ", ".join(SRC_FILES))
     return 0
 
 

@@ -74,14 +74,25 @@ def main(argv: list[str] | None = None) -> int:
             json.dump(meta, f, indent=2)
 
     print(f"wrote {out_path}")
+    tm = meta.get("tracemalloc_peak_mb")
+    rss = meta.get("rss_delta_mb")
+    acct = meta.get("peak_algorithm_mb", 0)
+    ms_tm = meta.get("ms_per_imu_second_traced")
     print(
         f"  samples={meta.get('n_samples')}  duration={meta.get('duration_s', 0):.2f}s  "
-        f"runtime={meta.get('runtime_s', 0):.3f}s  ms/s={meta.get('ms_per_imu_second', 0):.2f}"
+        f"runtime={meta.get('runtime_s', 0):.3f}s  "
+        f"ms/s={meta.get('ms_per_imu_second', 0):.2f}"
+        f"{'' if ms_tm is None else f'  ms/s_traced={float(ms_tm):.2f}'}"
     )
     print(
-        f"  algo_mem≈{meta.get('peak_algorithm_mb', 0):.2f} MB  "
+        f"  tracemalloc≈{tm if tm is not None else 'n/a'} MB  "
+        f"(account≈{acct:.2f} MB, rssΔ≈{rss if rss is not None else 'n/a'} MB)  "
+        f"storage={meta.get('sensor_storage', '?')}  "
         f"failed={meta.get('n_failed', 0)}  spikes={meta.get('n_spikes', 0)}  "
-        f"gaps={meta.get('n_gaps', 0)}  fallback={meta.get('fallback', False)}"
+        f"gaps={meta.get('n_gaps', 0)}  "
+        f"dropout_row={meta.get('dropout_row_frac', 0):.4f}  "
+        f"dropout_time={meta.get('dropout_time_frac', 0):.4f}  "
+        f"fallback={meta.get('fallback', False)}"
     )
     return 0
 
